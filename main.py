@@ -12,9 +12,17 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 FIREBASE_CREDS_STR = os.getenv("FIREBASE_CREDENTIALS")
 
+# Словник для перекладу колонок (малі літери, як ти попросив)
+COLUMN_MAPPING = {
+    "left": "на публікацію",
+    "center": "на тайп",
+    "right": "на редактуру"
+}
+
 def send_telegram_notification(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
+    # Використовуємо parse_mode HTML для безпечних гіперпосилань
+    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
     try:
         response = requests.post(url, json=payload)
         if response.status_code != 200:
@@ -32,20 +40,20 @@ try:
 except Exception as e:
     print(f"КРИТИЧНА ПОМИЛКА ініціалізації Firebase: {e}", flush=True)
 
-# Кеш для відстеження стану завдань на дошках: { board_id: { task_id: {title, column} } }
+# Кеш для відстеження стану завдань
 known_boards = {}
 is_initial_load = True
 
 def extract_tasks(doc_data):
-    """Допоміжна функція для збору всіх тасок з усіх масивів-колонок документа"""
+    """Допоміжна функція для збору ID, title та url завдань із масивів"""
     tasks = {}
     for key, value in doc_data.items():
-        # Шукаємо поля, які є масивами (left, center, right тощо)
         if isinstance(value, list):
             for item in value:
                 if isinstance(item, dict) and 'id' in item:
                     tasks[item['id']] = {
                         'title': item.get('title', 'Без назви'),
+                        'url': item.get('url', '#'),
                         'column': key
                     }
     return tasks
@@ -53,11 +61,10 @@ def extract_tasks(doc_data):
 def on_snapshot(col_snapshot, changes, read_time):
     global known_boards, is_initial_load
     
-    # Перший запуск: просто записуємо поточний стан усіх дощок у кеш, щоб не спамити старими тасками
     if is_initial_load:
         for doc in col_snapshot:
             known_boards[doc.id] = extract_tasks(doc.to_dict())
-        print(f"Початкове завантаження завершено. Кешовано дошок: {len(known_boards)}. Слухаю зміни...", flush=True)
+        print(f"Початкове завантаження завершено. Кешовано дошок: {len(known_boards)}.", flush=True)
         is_initial_load = False
         return
 
@@ -65,28 +72,43 @@ def on_snapshot(col_snapshot, changes, read_time):
         board_id = change.document.id
         doc_data = change.document.to_dict()
         
-        # Витягуємо таски, які є на дошці прямо зараз
+        # Отримуємо назву тайтлу з поля 'name' документа
+        board_name = doc_data.get('name', 'Невідомий тайтл')
+        
         current_tasks = extract_tasks(doc_data)
-        # Отримуємо таски, які були на цій дошці до цієї зміни
         old_tasks = known_boards.get(board_id, {})
 
         if change.type.name in ['ADDED', 'MODIFIED']:
-            # 1. Перевіряємо на наявність НОВИХ завдань або ПЕРЕМІЩЕНИХ
             for task_id, task_info in current_tasks.items():
+                
+                current_col_clean = COLUMN_MAPPING.get(task_info['column'], task_info['column'])
+
                 if task_id not in old_tasks:
-                    # Цього ID взагалі не було в базі -> це нове завдання
-                    msg = f"🆕 *Додано нове завдання!*\n\n📌 *Назва:* {task_info['title']}\n📋 *Колонка:* `{task_info['column']}`"
+                    # ПОДІЯ: Створення нової таски
+                    msg = (
+                        f"🆕 <b>Нова задача на тайтлі:</b> \"{board_name}\"\n"
+                        f"<b>Номер розділу:</b> {task_info['title']}\n"
+                        f"<b>Призначення:</b> {current_col_clean}\n"
+                        f"🔗 <a href=\"{task_info['url']}\">Перейти</a>"
+                    )
                     send_telegram_notification(msg)
                 
                 elif old_tasks[task_id]['column'] != task_info['column']:
-                    # ID існував, але поле колонки змінилося -> таску перетягнули
-                    msg = f"🔄 *Завдання переміщено!*\n\n📌 *Назва:* {task_info['title']}\n📥 *Нова колонка:* `{task_info['column']}`\n📤 *Було в:* `{old_tasks[task_id]['column']}`"
+                    # ПОДІЯ: Перетягування таски в іншу колонку
+                    old_col_clean = COLUMN_MAPPING.get(old_tasks[task_id]['column'], old_tasks[task_id]['column'])
+                    
+                    msg = (
+                        f"🔄 <b>Завдання переміщено на тайтлі:</b> \"{board_name}\"\n"
+                        f"<b>Номер розділу:</b> {task_info['title']}\n"
+                        f"<b>Нове призначення:</b> {current_col_clean}\n"
+                        f"<b>Було:</b> {old_col_clean}\n"
+                        f"🔗 <a href=\"{task_info['url']}\">Перейти</a>"
+                    )
                     send_telegram_notification(msg)
             
-            # Оновлюємо кеш цієї дошки для наступних перевірок
+            # Оновлюємо локальний кеш стану
             known_boards[board_id] = current_tasks
 
-# Слухаємо правильну колекцію з твого скріншоту
 collection_name = "boards"
 collection_ref = db.collection(collection_name)
 query_watch = collection_ref.on_snapshot(on_snapshot)
